@@ -1,31 +1,45 @@
 #!/usr/bin/env python3
-"""Webull署名中継: 足データ取得専用（読み取りのみ・発注系は一切なし）
+"""Webull署名中継 v2: 足データ取得専用（読み取りのみ・発注系は一切なし）
 
 Vercel サーバーレス関数。環境変数:
   WEBULL_APP_KEY / WEBULL_APP_SECRET … Webull OpenAPI(日本) の鍵。
-      Vercel の環境変数にだけ置く。コードやリポジトリには書かない。
-  RELAY_TOKEN … 中継の呼び出しトークン（Bearer）。呼び出し側と共有する。
+  RELAY_TOKEN … 中継の呼び出しトークン（Bearer）。
   WEBULL_ENDPOINT … 任意。既定 api.webull.co.jp
+  KV_REST_API_URL / KV_REST_API_TOKEN … Vercel KV (Upstash) 接続時に
+      Vercel が自動で入れる。アクセストークンの保管先として使う。
+
+モード（クエリ mode）:
+  bars（既定・無人経路）… 保管済みアクセストークンを set_token して
+      SDK初期化（トークン作成＋確認ポーリング）を迂回する。
+      トークンを新規作成することは絶対にしない。保管が無ければ
+      kind=token_missing を返して即終了する。
+  renew（立ち会い専用）… 通常のSDK初期化を実行し（アプリ確認プッシュが
+      飛ぶ）、得たトークンを KV とローカルファイルに保管する。
+      ポーリング上限は45秒（関数の60秒に収める）。
+  check … 保管済みトークンの状態だけを check_token で問い合わせる。
+      作成やプッシュの引き金にはならない。
+
+応答には計測（timing）とトークン状態（token: source/hash/expires）を
+含める。トークン文字列そのものは絶対に応答に含めない。
 
 呼び出し:
   GET /api/bars?symbols=SPY,QQQ&timespan=M15&count=200
+  GET /api/bars?mode=renew
+  GET /api/bars?mode=check
   Authorization: Bearer <RELAY_TOKEN>
-
-署名は公式SDK（webull-openapi-python-sdk）が内部で行う。
-銘柄ごとの取得パターン（カテゴリの試行順・レスポンス解釈）は
-旧 v1 スキャナの実績コードに合わせた。
 """
+import hashlib
 import hmac
 import json
 import os
+import time
+import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
 
 ALLOWED_SYMBOLS = {
-    # 指数の代用ETF
     "SPY", "QQQ", "IWM", "DIA", "SOXX",
-    # 大型株
     "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA",
     "AMD", "AVGO", "NFLX", "PLTR", "COIN", "MSTR", "JPM",
 }
@@ -34,30 +48,132 @@ ALLOWED_TIMESPANS = {"M1", "M5", "M15", "M30", "M60", "M240", "D", "W"}
 MAX_SYMBOLS = 20
 MAX_COUNT = 1200
 
-_client = None
+TOKEN_KEY = "webull_token_v1"
+TOKEN_DIR = "/tmp/webull-token"
+TOKEN_FILE = os.path.join(TOKEN_DIR, "token.txt")
+
+_clients = {}
 
 
-def get_client():
-    global _client
-    if _client is None:
-        # Vercelの /var/task は読み取り専用。SDKがカレントにログを書くため
-        # 書き込み可能な /tmp へ移動してから初期化する。
+def token_hash(token):
+    return hashlib.sha256(token.encode()).hexdigest()[:8]
+
+
+# ---------- トークン保管（KV / ローカルファイル） ----------
+
+def _kv_request(path, body=None):
+    url = os.environ.get("KV_REST_API_URL", "")
+    tok = os.environ.get("KV_REST_API_TOKEN", "")
+    if not url or not tok:
+        return None
+    req = urllib.request.Request(
+        url.rstrip("/") + path,
+        data=body.encode() if body is not None else None,
+        headers={"Authorization": f"Bearer {tok}"},
+        method="POST" if body is not None else "GET")
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return json.loads(resp.read().decode())
+
+
+def kv_available():
+    return bool(os.environ.get("KV_REST_API_URL")
+                and os.environ.get("KV_REST_API_TOKEN"))
+
+
+def load_stored_token():
+    """(record, source) を返す。record は {token, expires, status}"""
+    if kv_available():
         try:
-            os.chdir("/tmp")
+            res = _kv_request(f"/get/{TOKEN_KEY}")
+            raw = (res or {}).get("result")
+            if raw:
+                rec = json.loads(raw)
+                if rec.get("token"):
+                    return rec, "kv"
         except Exception:
             pass
-        from webull.core.client import ApiClient
-        from webull.data.data_client import DataClient
-        api = ApiClient(os.environ["WEBULL_APP_KEY"],
-                        os.environ["WEBULL_APP_SECRET"], "jp")
-        api.add_endpoint("jp", os.environ.get("WEBULL_ENDPOINT",
-                                              "api.webull.co.jp"))
-        _client = DataClient(api)
-    return _client
+    try:
+        with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f.readlines()]
+        if lines and lines[0]:
+            return {"token": lines[0],
+                    "expires": int(lines[1]) if len(lines) > 1
+                    and lines[1].isdigit() else 0,
+                    "status": lines[2] if len(lines) > 2 else ""}, "file"
+    except Exception:
+        pass
+    return None, None
 
+
+def save_stored_token(record):
+    stored = []
+    try:
+        os.makedirs(TOKEN_DIR, exist_ok=True)
+        with open(TOKEN_FILE, "w", encoding="utf-8") as f:
+            f.write(record["token"] + "\n")
+            f.write(str(record.get("expires", 0)) + "\n")
+            f.write(record.get("status", "") + "\n")
+        stored.append("file")
+    except Exception:
+        pass
+    if kv_available():
+        try:
+            _kv_request(f"/set/{TOKEN_KEY}", json.dumps(record))
+            stored.append("kv")
+        except Exception:
+            pass
+    return stored
+
+
+# ---------- SDKクライアント構築 ----------
+
+def _base_api(token_check_seconds):
+    os.chdir("/tmp")
+    os.environ["WEBULL_OPENAPI_TOKEN_DIR"] = TOKEN_DIR
+    from webull.core.client import ApiClient
+    api = ApiClient(os.environ["WEBULL_APP_KEY"],
+                    os.environ["WEBULL_APP_SECRET"], "jp",
+                    token_check_duration_seconds=token_check_seconds,
+                    token_check_interval_seconds=5)
+    api.add_endpoint("jp", os.environ.get("WEBULL_ENDPOINT",
+                                          "api.webull.co.jp"))
+    return api
+
+
+def build_bypass_client(record):
+    """保管トークンをセットし、SDK初期化を迂回して DataClient を作る"""
+    key = "bypass:" + token_hash(record["token"])
+    if key in _clients:
+        return _clients[key]
+    from webull.data.data_client import DataClient
+    from webull.core.http.initializer.client_initializer import (
+        ClientInitializer)
+    api = _base_api(10)
+    api.set_token(record["token"])
+    original = ClientInitializer.initializer
+    ClientInitializer.initializer = staticmethod(lambda api_client: None)
+    try:
+        client = DataClient(api)
+    finally:
+        ClientInitializer.initializer = original
+    _clients[key] = client
+    return client
+
+
+def build_renew_client():
+    """通常のSDK初期化（トークン作成＋確認ポーリング最大45秒）"""
+    if "renew" in _clients:
+        return _clients["renew"]
+    from webull.data.data_client import DataClient
+    api = _base_api(45)
+    client = DataClient(api)  # ここで初期化が走る（プッシュ発生）
+    _clients["renew"] = (client, api)
+    return client, api
+
+
+# ---------- 足データ ----------
 
 def parse_bars(js):
-    """レスポンスの形が違っても足のリストを取り出す（v1踏襲）"""
     if isinstance(js, dict):
         for k in ("bars", "result", "data", "items"):
             if k in js:
@@ -73,16 +189,16 @@ def parse_bars(js):
     return []
 
 
-def fetch_bars(symbol, timespan, count):
+def fetch_bars(client, symbol, timespan, count):
     cats = ["US_ETF", "US_STOCK"] if symbol in ETF_FIRST \
         else ["US_STOCK", "US_ETF"]
     last_status = None
     for cat in cats:
         try:
-            res = get_client().market_data.get_history_bar(
+            res = client.market_data.get_history_bar(
                 symbol, cat, timespan, count)
         except TypeError:
-            res = get_client().market_data.get_history_bar(
+            res = client.market_data.get_history_bar(
                 symbol, cat, timespan)
         last_status = getattr(res, "status_code", None)
         if last_status == 200:
@@ -114,8 +230,21 @@ def normalize(rows):
     return out
 
 
+def classify_error(e):
+    msg = str(e).lower()
+    code = str(getattr(e, "error_code", "") or
+               getattr(e, "_error_code", "") or "").lower()
+    if "token" in msg or "token" in code:
+        return "token_invalid"
+    if "timeout" in msg or "timed out" in msg:
+        return "timeout"
+    return "api_error"
+
+
+# ---------- ハンドラ ----------
+
 class handler(BaseHTTPRequestHandler):
-    def log_message(self, *args):  # アクセスログにトークンを残さない
+    def log_message(self, *args):
         pass
 
     def _send(self, code, obj):
@@ -127,12 +256,21 @@ class handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        t0 = time.time()
         token = os.environ.get("RELAY_TOKEN", "")
         auth = self.headers.get("Authorization", "")
         if not token or not hmac.compare_digest(
                 auth, f"Bearer {token}"):
             return self._send(401, {"error": "unauthorized"})
         q = parse_qs(urlparse(self.path).query)
+        mode = q.get("mode", ["bars"])[0]
+        if mode == "renew":
+            return self._do_renew(t0)
+        if mode == "check":
+            return self._do_check(t0)
+        return self._do_bars(q, t0)
+
+    def _do_bars(self, q, t0):
         symbols = [s.strip().upper()
                    for s in q.get("symbols", [""])[0].split(",") if s.strip()]
         timespan = q.get("timespan", ["M15"])[0].upper()
@@ -148,16 +286,99 @@ class handler(BaseHTTPRequestHandler):
         if timespan not in ALLOWED_TIMESPANS:
             return self._send(400, {"error": "timespan が不正"})
         count = max(1, min(MAX_COUNT, count))
-        debug = q.get("debug", [""])[0] == "1"
+
+        record, source = load_stored_token()
+        if record is None:
+            return self._send(200, {
+                "error": "保管済みトークンがありません",
+                "kind": "token_missing",
+                "token": {"source": None},
+                "timing": {"total_ms": int((time.time() - t0) * 1000)}})
+        t_init = time.time()
+        try:
+            client = build_bypass_client(record)
+        except Exception as e:
+            return self._send(200, {
+                "error": str(e)[:200], "kind": classify_error(e),
+                "token": {"source": source,
+                          "hash": token_hash(record["token"])},
+                "timing": {"total_ms": int((time.time() - t0) * 1000)}})
+        init_ms = int((time.time() - t_init) * 1000)
+
         result = {}
+        per_symbol = {}
+        kinds = {}
         for s in symbols:
+            ts = time.time()
             try:
-                raw = fetch_bars(s, timespan, count)
+                raw = fetch_bars(client, s, timespan, count)
                 result[s] = {"bars": normalize(raw)}
-                if debug:
-                    result[s]["raw_count"] = len(raw) if raw else 0
-                    result[s]["raw_sample"] = raw[:2] if raw else raw
             except Exception as e:
                 result[s] = {"error": str(e)[:200]}
-        return self._send(200, {"timespan": timespan, "count": count,
-                                "data": result})
+                kinds[s] = classify_error(e)
+            per_symbol[s] = int((time.time() - ts) * 1000)
+        out = {"timespan": timespan, "count": count, "data": result,
+               "token": {"source": source,
+                         "hash": token_hash(record["token"]),
+                         "expires": record.get("expires", 0)},
+               "timing": {"init_ms": init_ms, "per_symbol_ms": per_symbol,
+                          "total_ms": int((time.time() - t0) * 1000)}}
+        if kinds:
+            out["error_kinds"] = kinds
+        return self._send(200, out)
+
+    def _do_renew(self, t0):
+        try:
+            client, api = build_renew_client()
+        except Exception as e:
+            rec, _src = load_stored_token()
+            return self._send(200, {
+                "mode": "renew", "ok": False,
+                "kind": "token_not_verified",
+                "error": str(e)[:200],
+                "token": {"status": rec.get("status") if rec else None,
+                          "expires": rec.get("expires") if rec else None},
+                "timing": {"total_ms": int((time.time() - t0) * 1000)}})
+        rec, _src = load_stored_token()
+        if rec is None or not api.get_token():
+            return self._send(200, {
+                "mode": "renew", "ok": False, "kind": "token_missing",
+                "timing": {"total_ms": int((time.time() - t0) * 1000)}})
+        rec["token"] = api.get_token()
+        rec["saved_at"] = datetime.now(timezone.utc).isoformat()
+        stored = save_stored_token(rec)
+        return self._send(200, {
+            "mode": "renew", "ok": True,
+            "token": {"status": rec.get("status"),
+                      "expires": rec.get("expires"),
+                      "hash": token_hash(rec["token"])},
+            "stored": stored,
+            "timing": {"total_ms": int((time.time() - t0) * 1000)}})
+
+    def _do_check(self, t0):
+        record, source = load_stored_token()
+        if record is None:
+            return self._send(200, {
+                "mode": "check", "ok": False, "kind": "token_missing",
+                "timing": {"total_ms": int((time.time() - t0) * 1000)}})
+        try:
+            from webull.core.http.initializer.token.token_operation import (
+                TokenOperation)
+            api = _base_api(10)
+            resp = TokenOperation(api).check_token(record["token"])
+            js = resp.json() or {}
+            return self._send(200, {
+                "mode": "check", "ok": True,
+                "token": {"status": js.get("status"),
+                          "expires": js.get("expires"),
+                          "hash": token_hash(record["token"]),
+                          "source": source,
+                          "stored_expires": record.get("expires", 0)},
+                "timing": {"total_ms": int((time.time() - t0) * 1000)}})
+        except Exception as e:
+            return self._send(200, {
+                "mode": "check", "ok": False,
+                "kind": classify_error(e), "error": str(e)[:200],
+                "token": {"hash": token_hash(record["token"]),
+                          "source": source},
+                "timing": {"total_ms": int((time.time() - t0) * 1000)}})
