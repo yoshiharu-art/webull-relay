@@ -71,3 +71,10 @@ Webull OpenAPI（api.webull.co.jp / 日本リージョン）
 - App Secret は Vercel 環境変数の外に出ない。GitHub リポジトリは公開されても鍵を含まない。
 - 中継トークンは Muse の Secure Vault にのみ保存。漏洩時は Vercel 側で差し替えれば即無効化できる。
 - 中継は読み取り専用コードのみ。取引・口座系の呼び出しは実装しない。
+
+## v2 追記（2026-11-17）
+
+- 遅延の主因はSDKのトークン初期化（DataClient生成時に create_token→確認ポーリング最大300秒）が、関数の60秒上限と衝突することと判明。
+- 中継v2: 無人経路（bars）は保管済みトークンを set_token して初期化を迂回し、トークンを作らない。renew（立ち会い専用）だけが初期化を実行し、得たトークンを Vercel KV（キー webull_token_v1）とローカルファイルに保管する。check は check_token 単体の状態確認。
+- KVは新規作成せず、既存ストア spy-v64-news-free（Upstash Free）を webull-relay に接続して流用（新規作成は支払い方法の登録が必須だったため）。環境変数 KV_REST_API_URL / KV_REST_API_TOKEN はプレフィックスなしで追加された。
+- 応答には timing と token（source/hash/expires）の計測を含める。トークン文字列は応答に出さない。
