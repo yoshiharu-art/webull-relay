@@ -29,6 +29,7 @@ Vercel サーバーレス関数。環境変数:
   Authorization: Bearer <RELAY_TOKEN>
 """
 import hashlib
+import re
 import hmac
 import json
 import os
