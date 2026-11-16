@@ -67,6 +67,8 @@ def parse_bars(js):
     if isinstance(js, list):
         if js and isinstance(js[0], dict) and "bars" in js[0]:
             return js[0]["bars"]
+        if js and isinstance(js[0], dict) and "result" in js[0]:
+            return parse_bars(js[0]["result"])
         return js
     return []
 
