@@ -146,10 +146,15 @@ class handler(BaseHTTPRequestHandler):
         if timespan not in ALLOWED_TIMESPANS:
             return self._send(400, {"error": "timespan が不正"})
         count = max(1, min(MAX_COUNT, count))
+        debug = q.get("debug", [""])[0] == "1"
         result = {}
         for s in symbols:
             try:
-                result[s] = {"bars": normalize(fetch_bars(s, timespan, count))}
+                raw = fetch_bars(s, timespan, count)
+                result[s] = {"bars": normalize(raw)}
+                if debug:
+                    result[s]["raw_count"] = len(raw) if raw else 0
+                    result[s]["raw_sample"] = raw[:2] if raw else raw
             except Exception as e:
                 result[s] = {"error": str(e)[:200]}
         return self._send(200, {"timespan": timespan, "count": count,
