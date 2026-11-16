@@ -60,6 +60,12 @@ def token_hash(token):
     return hashlib.sha256(token.encode()).hexdigest()[:8]
 
 
+def sanitize(msg):
+    # SDKのエラーメッセージにはマスク済みトークン断片が混ざることがあるため除去する
+    s = re.sub(r"token[:=]\S+", "token:<redacted>", str(msg))
+    return s[:200]
+
+
 # ---------- トークン保管（KV / ローカルファイル） ----------
 
 def _kv_request(path, body=None):
@@ -300,7 +306,7 @@ class handler(BaseHTTPRequestHandler):
             client = build_bypass_client(record)
         except Exception as e:
             return self._send(200, {
-                "error": str(e)[:200], "kind": classify_error(e),
+                "error": sanitize(e), "kind": classify_error(e),
                 "token": {"source": source,
                           "hash": token_hash(record["token"])},
                 "timing": {"total_ms": int((time.time() - t0) * 1000)}})
@@ -315,7 +321,7 @@ class handler(BaseHTTPRequestHandler):
                 raw = fetch_bars(client, s, timespan, count)
                 result[s] = {"bars": normalize(raw)}
             except Exception as e:
-                result[s] = {"error": str(e)[:200]}
+                result[s] = {"error": sanitize(e)}
                 kinds[s] = classify_error(e)
             per_symbol[s] = int((time.time() - ts) * 1000)
         out = {"timespan": timespan, "count": count, "data": result,
@@ -336,7 +342,7 @@ class handler(BaseHTTPRequestHandler):
             return self._send(200, {
                 "mode": "renew", "ok": False,
                 "kind": "token_not_verified",
-                "error": str(e)[:200],
+                "error": sanitize(e),
                 "token": {"status": rec.get("status") if rec else None,
                           "expires": rec.get("expires") if rec else None},
                 "timing": {"total_ms": int((time.time() - t0) * 1000)}})
@@ -379,7 +385,7 @@ class handler(BaseHTTPRequestHandler):
         except Exception as e:
             return self._send(200, {
                 "mode": "check", "ok": False,
-                "kind": classify_error(e), "error": str(e)[:200],
+                "kind": classify_error(e), "error": sanitize(e),
                 "token": {"hash": token_hash(record["token"]),
                           "source": source},
                 "timing": {"total_ms": int((time.time() - t0) * 1000)}})
