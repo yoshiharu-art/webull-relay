@@ -40,6 +40,12 @@ _client = None
 def get_client():
     global _client
     if _client is None:
+        # Vercelの /var/task は読み取り専用。SDKがカレントにログを書くため
+        # 書き込み可能な /tmp へ移動してから初期化する。
+        try:
+            os.chdir("/tmp")
+        except Exception:
+            pass
         from webull.core.client import ApiClient
         from webull.data.data_client import DataClient
         api = ApiClient(os.environ["WEBULL_APP_KEY"],
