@@ -248,8 +248,7 @@ def fetch_contracts(client, underlying, start_date, end_date,
     pages = 0
     while pages < MAX_PAGES:
         kwargs = dict(category="US_OPTION",
-                      underlying_symbols=underlying,
-                      page_size=page_size)
+                      underlying_symbols=underlying)
         if start_date:
             kwargs["start_date"] = start_date
         if end_date:
