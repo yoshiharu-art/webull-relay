@@ -2,9 +2,6 @@
   "functions": {
     "api/bars.py": {
       "maxDuration": 60
-    },
-    "api/options.py": {
-      "maxDuration": 60
     }
   }
 }

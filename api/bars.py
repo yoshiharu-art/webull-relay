@@ -48,6 +48,9 @@ ETF_FIRST = {"SPY", "QQQ", "IWM", "DIA", "SOXX"}
 ALLOWED_TIMESPANS = {"M1", "M5", "M15", "M30", "M60", "M240", "D", "W"}
 MAX_SYMBOLS = 20
 MAX_COUNT = 1200
+MAX_SNAPSHOT_SYMBOLS = 20
+MAX_PAGES = 6
+MAX_PAGE_SIZE = 1000
 
 TOKEN_KEY = "webull_token_v1"
 TOKEN_DIR = "/tmp/webull-token"
@@ -237,6 +240,64 @@ def normalize(rows):
     return out
 
 
+def fetch_contracts(client, underlying, start_date, end_date,
+                    option_type, strike_gte, strike_lte, page_size):
+    """契約一覧をページングしながら集める。生の行をそのまま返す"""
+    items = []
+    pagination_key = None
+    pages = 0
+    while pages < MAX_PAGES:
+        kwargs = dict(category="US_OPTION",
+                      underlying_symbols=underlying,
+                      page_size=page_size)
+        if start_date:
+            kwargs["start_date"] = start_date
+        if end_date:
+            kwargs["end_date"] = end_date
+        if option_type:
+            kwargs["option_type"] = option_type
+        if strike_gte:
+            kwargs["strike_price_gte"] = strike_gte
+        if strike_lte:
+            kwargs["strike_price_lte"] = strike_lte
+        if pagination_key:
+            kwargs["pagination_key"] = pagination_key
+        res = client.instrument.list_option_contracts(**kwargs)
+        status = getattr(res, "status_code", None)
+        if status != 200:
+            raise RuntimeError(f"契約一覧が取得できません (HTTP {status})")
+        js = res.json()
+        rows, pagination_key = parse_contract_page(js)
+        items.extend(rows)
+        pages += 1
+        if not pagination_key:
+            break
+    return items, pages
+
+
+def parse_contract_page(js):
+    """(行リスト, 次ページキー) を取り出す。構造が未知なので柔軟に読む"""
+    if isinstance(js, dict):
+        key = js.get("pagination_key") or js.get("next_pagination_key")
+        for k in ("items", "contracts", "data", "result", "list"):
+            if isinstance(js.get(k), list):
+                return js[k], key
+        vals = [v for v in js.values() if isinstance(v, list)]
+        return (vals[0] if vals else []), key
+    if isinstance(js, list):
+        return js, None
+    return [], None
+
+
+def fetch_snapshot(client, symbols):
+    res = client.option_market_data.get_option_snapshot(
+        ",".join(symbols), "US_OPTION")
+    status = getattr(res, "status_code", None)
+    if status != 200:
+        raise RuntimeError(f"気配が取得できません (HTTP {status})")
+    return res.json()
+
+
 def classify_error(e):
     msg = str(e).lower()
     code = str(getattr(e, "error_code", "") or
@@ -275,6 +336,10 @@ class handler(BaseHTTPRequestHandler):
             return self._do_renew(t0)
         if mode == "check":
             return self._do_check(t0)
+        if mode == "contracts":
+            return self._do_contracts(q, t0)
+        if mode == "snapshot":
+            return self._do_snapshot(q, t0)
         return self._do_bars(q, t0)
 
     def _do_bars(self, q, t0):
@@ -389,3 +454,81 @@ class handler(BaseHTTPRequestHandler):
                 "token": {"hash": token_hash(record["token"]),
                           "source": source},
                 "timing": {"total_ms": int((time.time() - t0) * 1000)}})
+
+    def _client_or_error(self, t0):
+        """(client, source, record, error_response) を返す"""
+        record, source = load_stored_token()
+        if record is None:
+            return None, None, None, self._send(200, {
+                "error": "保管済みトークンがありません",
+                "kind": "token_missing",
+                "token": {"source": None},
+                "timing": {"total_ms": int((time.time() - t0) * 1000)}})
+        try:
+            client = build_bypass_client(record)
+        except Exception as e:
+            return None, None, None, self._send(200, {
+                "error": sanitize(e), "kind": classify_error(e),
+                "token": {"source": source,
+                          "hash": token_hash(record["token"])},
+                "timing": {"total_ms": int((time.time() - t0) * 1000)}})
+        return client, source, record, None
+
+    def _do_contracts(self, q, t0):
+        underlying = q.get("underlying", [""])[0].strip().upper()
+        if underlying not in ALLOWED_SYMBOLS:
+            return self._send(400, {"error": "underlying が許可外"})
+        start_date = q.get("start", [""])[0].strip() or None
+        end_date = q.get("end", [""])[0].strip() or None
+        option_type = q.get("type", [""])[0].strip().upper() or None
+        if option_type not in (None, "CALL", "PUT"):
+            return self._send(400, {"error": "type が不正"})
+        strike_gte = q.get("strike_gte", [""])[0].strip() or None
+        strike_lte = q.get("strike_lte", [""])[0].strip() or None
+        try:
+            page_size = int(q.get("page_size", ["200"])[0])
+        except ValueError:
+            page_size = 200
+        page_size = max(1, min(MAX_PAGE_SIZE, page_size))
+        client, source, record, err = self._client_or_error(t0)
+        if err is not None:
+            return err
+        ts = time.time()
+        try:
+            items, pages = fetch_contracts(
+                client, underlying, start_date, end_date, option_type,
+                strike_gte, strike_lte, page_size)
+            out = {"mode": "contracts", "underlying": underlying,
+                   "count": len(items), "pages": pages, "data": items}
+        except Exception as e:
+            out = {"mode": "contracts", "error": sanitize(e),
+                   "kind": classify_error(e)}
+        out["token"] = {"source": source,
+                        "hash": token_hash(record["token"]),
+                        "expires": record.get("expires", 0)}
+        out["timing"] = {"fetch_ms": int((time.time() - ts) * 1000),
+                         "total_ms": int((time.time() - t0) * 1000)}
+        return self._send(200, out)
+
+    def _do_snapshot(self, q, t0):
+        symbols = [s.strip().upper()
+                   for s in q.get("symbols", [""])[0].split(",")
+                   if s.strip()]
+        if not symbols or len(symbols) > MAX_SNAPSHOT_SYMBOLS:
+            return self._send(400, {"error": "symbols が不正"})
+        client, source, record, err = self._client_or_error(t0)
+        if err is not None:
+            return err
+        ts = time.time()
+        try:
+            data = fetch_snapshot(client, symbols)
+            out = {"mode": "snapshot", "symbols": symbols, "data": data}
+        except Exception as e:
+            out = {"mode": "snapshot", "error": sanitize(e),
+                   "kind": classify_error(e)}
+        out["token"] = {"source": source,
+                        "hash": token_hash(record["token"]),
+                        "expires": record.get("expires", 0)}
+        out["timing"] = {"fetch_ms": int((time.time() - ts) * 1000),
+                         "total_ms": int((time.time() - t0) * 1000)}
+        return self._send(200, out)
